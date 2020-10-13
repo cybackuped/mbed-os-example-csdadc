@@ -10,10 +10,6 @@
 *
 * Related Document: README.md
 *
-* Supported Kits (Target Names):
-*   CY8CKIT-062-BLE PSoC 6 BLE Pioneer Kit (CY8CKIT_062_BLE)
-*   CY8CKIT-062-WiFi-BT PSoC 6 WiFi-BT Pioneer Kit (CY8CKIT_062_WIFI_BT)
-*   CY8CPROTO-062-4343W PSoC 6 Wi-Fi BT Prototyping Kit (CY8CPROTO_062_4343W)
 *
 *******************************************************************************
 * Copyright (2019), Cypress Semiconductor Corporation. All rights reserved.
@@ -47,7 +43,6 @@
 * indemnify Cypress against all liability.
 *******************************************************************************/
 
-
 /*******************************************************************************
 * Header files including
 ********************************************************************************/
@@ -55,75 +50,39 @@
 #include "cy_pdl.h"
 #include "cy_device_headers.h"
 #include "cy_csdadc.h"
-
+#include "cycfg.h"
+#include "cybsp.h"
 
 /*******************************************************************************
 * Global constants
 ********************************************************************************/
-#define CSD_HW                  (CSD0)
-#define CHANNEL_IDX0_BIT_POS    (0u)                        /* Channel 0 */
-#define CHANNEL_IDX0_BIT_MASK   (1 << CHANNEL_IDX0_BIT_POS)
-#define CSDADC_SCAN_PERIOD      (1000)                      /* in millisecond */
-#define CSDADC_SCAN_WAIT_DELAY  (1)                         /* in millisecond */
-
+#define CHANNEL_IDX0_BIT_POS (0u) /* Channel 0 */
+#define CHANNEL_IDX0_BIT_MASK (1 << CHANNEL_IDX0_BIT_POS)
+#define CSDADC_SCAN_PERIOD (1s)    /* in millisecond */
+#define CSDADC_SCAN_WAIT_DELAY (1) /* in millisecond */
 
 /*******************************************************************************
 * Function Prototypes
 ********************************************************************************/
 static void csdadc_interrupt_handler(void);
-static void config_routing(void);
 static void check_status(const char *message, uint32_t status);
-static void csdadc_scan(void);
-static void config_clock(void);
+static void csdadc_convert(void);
 
 /*******************************************************************************
 * Interrupt configuration
 *******************************************************************************/
 const cy_stc_sysint_t csdadc_interrupt_config =
-{
+    {
         .intrSrc = csd_interrupt_IRQn,
         .intrPriority = 7u,
-};
-
+    };
 
 /*******************************************************************************
 * Global variables
 *******************************************************************************/
 EventQueue queue;
-Semaphore csdadc_sem(0,1);
-cy_stc_csd_context_t cy_csd_context;
-cy_stc_csdadc_context_t cy_csdadc_context;
-
-static const cy_stc_csdadc_ch_pin_t csdadc_channel_list[] =
-{
-    [0] = {
-            .ioPcPtr = GPIO_PRT10,
-            .pin = 0u,
-          },
-};
-
-const cy_stc_csdadc_config_t csdadc_config =
-{
-    .ptrPinList = &csdadc_channel_list[0u],
-    .base = CSD_HW,
-    .csdCxtPtr = &cy_csd_context,
-    .cpuClk = 144000000u,
-    .periClk = 50000000u,
-    .vref = -1,
-    .vdda = 3300u,
-    .calibrInterval = 30u,
-    .range = CY_CSDADC_RANGE_VDDA,
-    .resolution = CY_CSDADC_RESOLUTION_10BIT,
-    .periDivTyp = CY_SYSCLK_DIV_8_BIT,
-    .numChannels = 1u,
-    .idac = 31u,
-    .operClkDivider = 1u,
-    .azTime = 5u,
-    .acqTime = 10u,
-    .csdInitTime = 25u,
-    .idacCalibrationEn = 0u,
-    .periDivInd = 0u,
-};
+Semaphore csdadc_sem(0, 1);
+cy_stc_csdadc_context_t csdadc_context;
 
 /*****************************************************************************
 * Function Name: main()
@@ -135,18 +94,16 @@ const cy_stc_csdadc_config_t csdadc_config =
 *****************************************************************************/
 int main(void)
 {
+    cybsp_init();
     /* Variable used for storing CSDADC API return result */
     cy_status status;
-
-    config_clock();
-    config_routing();
 
     /* \x1b[2J\x1b[;H - ANSI ESC sequence for clear screen */
     printf("\x1b[2J\x1b[;H");
     printf("CSDADC Code Example\r\n\n");
 
     /* Initialize CSDADC */
-    status = Cy_CSDADC_Init(&csdadc_config, &cy_csdadc_context);
+    status = Cy_CSDADC_Init(&CSDADC_csdadc_config, &csdadc_context);
     check_status("CSDADC initialization failed.", status);
 
     /* Initialize CSDADC interrupt */
@@ -155,7 +112,7 @@ int main(void)
     NVIC_EnableIRQ(csdadc_interrupt_config.intrSrc);
 
     /* Initialize CSDADC firmware modules */
-    status = Cy_CSDADC_Enable(&cy_csdadc_context);
+    status = Cy_CSDADC_Enable(&csdadc_context);
     check_status("CSDADC firmware module initialization failed.", status);
 
     /* Reseting the semaphore before starting CSDADC Thread */
@@ -166,55 +123,58 @@ int main(void)
      */
     Thread thread(osPriorityNormal, OS_STACK_SIZE, NULL, "CSDADC Thread");
     thread.start(callback(&queue, &EventQueue::dispatch_forever));
-    queue.call_every(CSDADC_SCAN_PERIOD, csdadc_scan);
+    queue.call_every(CSDADC_SCAN_PERIOD, csdadc_convert);
 
-    wait(osWaitForever);
+    while (true)
+    {
+        ThisThread::sleep_for(1000s);
+    }
+
 }
 
-
 /*****************************************************************************
-* Function Name: csdadc_scan()
+* Function Name: csdadc_convert()
 ******************************************************************************
 * Summary:
 *   This function starts the CSDADC conversion, and prints the result on
 *   terminal application.
 *
 *****************************************************************************/
-static void csdadc_scan(void)
+static void csdadc_convert(void)
 {
     uint32_t adcResult;
-    cy_en_csdadc_status_t  status;
+    cy_en_csdadc_status_t status;
 
-    status = Cy_CSDADC_IsEndConversion(&cy_csdadc_context);
-    if(CY_CSDADC_SUCCESS == status)
+
+    status = Cy_CSDADC_StartConvert(CY_CSDADC_SINGLE_SHOT,
+                                    CHANNEL_IDX0_BIT_MASK, &csdadc_context);
+    check_status("Unable to start ADC conversion.", status);
+
+    /* Wait until the conversion completes */
+    csdadc_sem.acquire();
+
+    status = Cy_CSDADC_IsEndConversion(&csdadc_context);
+
+    if (CY_CSDADC_SUCCESS == status)
     {
-        status = Cy_CSDADC_StartConvert(CY_CSDADC_SINGLE_SHOT,
-            CHANNEL_IDX0_BIT_MASK, &cy_csdadc_context);
-        check_status("Unable to start ADC conversion.", status);
-
-        /* Wait until the conversion completes */
-        csdadc_sem.acquire();
-
-        status = Cy_CSDADC_IsEndConversion(&cy_csdadc_context);
-        if(CY_CSDADC_SUCCESS == status)
-        {
-            adcResult = Cy_CSDADC_GetResult(CHANNEL_IDX0_BIT_POS,
-                         &cy_csdadc_context);
-            printf("ADC Count: %lu\n\r", adcResult);
-        }
+        adcResult = Cy_CSDADC_GetResult(CHANNEL_IDX0_BIT_POS,
+                                        &csdadc_context);
+        printf("ADC Count: %lu\n\r", (unsigned long)adcResult);
     }
+
+
     if (CY_CSDADC_OVERFLOW == status)
     {
         printf("Last conversion caused overflow. Re-calibrating CSDADC\n\r");
-        status = Cy_CSDADC_Calibrate(&cy_csdadc_context);
+        status = Cy_CSDADC_Calibrate(&csdadc_context);
         check_status("CSDADC calibration failed", status);
     }
     else
     {
         check_status("CSDADC hardware error", status);
     }
-}
 
+}
 
 /*****************************************************************************
 * Function Name: csdadc_interrupt_handler()
@@ -225,44 +185,14 @@ static void csdadc_scan(void)
 *****************************************************************************/
 static void csdadc_interrupt_handler(void)
 {
-    Cy_CSDADC_InterruptHandler(CSD_HW, &cy_csdadc_context);
+    Cy_CSDADC_InterruptHandler(CSDADC_HW, &csdadc_context);
     csdadc_sem.release();
 }
 
-
-/*****************************************************************************
-* Function Name: config_routing()
-******************************************************************************
-* Summary:
-*   Configures the AMUX bus segment.
-*
-*****************************************************************************/
-static void config_routing(void)
-{
-    HSIOM->AMUX_SPLIT_CTL[5] = HSIOM_AMUX_SPLIT_CTL_SWITCH_BB_SL_Msk |
-        HSIOM_AMUX_SPLIT_CTL_SWITCH_BB_SR_Msk;
-}
-
-
-/*****************************************************************************
-* Function Name: config_routing()
-******************************************************************************
-* Summary:
-*   Configures the peripheral clock divider for CSDADC.
-*
-*****************************************************************************/
-static void config_clock(void)
-{
-    Cy_SysClk_PeriphDisableDivider(CY_SYSCLK_DIV_8_BIT, 0U);
-    Cy_SysClk_PeriphSetDivider(CY_SYSCLK_DIV_8_BIT, 0U, 0U);
-    Cy_SysClk_PeriphEnableDivider(CY_SYSCLK_DIV_8_BIT, 0U);
-    Cy_SysClk_PeriphAssignDivider(PCLK_CSD_CLOCK, CY_SYSCLK_DIV_8_BIT, 0U);
-}
-
-
 /*******************************************************************************
 * Function Name: check_status()
-****************************************************************************//**
+****************************************************************************/
+/**
 * Summary:
 *   Asserts the non-zero status and prints the message.
 *
@@ -273,11 +203,13 @@ static void config_clock(void)
 *******************************************************************************/
 static inline void check_status(const char *message, uint32_t status)
 {
-    if(0u != status)
+    if (0u != status)
     {
-        printf("[Error] : %s Error Code: 0x%08lX\r\n", message, status);
-        while(1);
+        printf("[Error] : %s Error Code: 0x%08lX\r\n", message, (unsigned long)status);
+        while (1u){}
+            
     }
+
 }
 
 /* [] END OF FILE */
